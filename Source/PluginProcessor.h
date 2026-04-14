@@ -121,6 +121,8 @@ private:
         void setFocusAmount(float amount) noexcept;
         void setGlideAmount(float amount) noexcept;
         void setEnvModAmount(float amount) noexcept;
+        void setEnvFollowMode(int mode) noexcept;
+        void setEnvFollowSource(int source) noexcept;
         void setSidechainActive(bool isActive) noexcept;
         void run() override;
 
@@ -144,7 +146,7 @@ private:
         void compressSpectrumToBands();
         void runSinkhornBarycenter(float morph, float focus);
         void expandBandsToSpectrum(float glide);
-        float computeTargetEnvelopeFromMagnitudes(int numChannels) noexcept;
+        float computeAnalysisEnvelopeFromMagnitudes(int numChannels, bool useSourceForEnvelope) noexcept;
         void synthesizeUsingSourcePhase(uint64_t frameStartSample, int numChannels);
         void resetStreamingState(double sampleRate, int maxBlockSize) noexcept;
 
@@ -153,6 +155,8 @@ private:
         std::atomic<float> focusAmount { 1.0f };
         std::atomic<float> glideAmount { 0.0f };
         std::atomic<float> envModAmount { 0.0f };
+        std::atomic<int> envFollowMode { 0 };   // 0: Modulation, 1: Shaping
+        std::atomic<int> envFollowSource { 1 }; // 0: Source, 1: Sidechain
         std::atomic<bool> sidechainActive { false };
         double sampleRateHz = 44100.0;
         int maxBlock = 512;
@@ -208,6 +212,7 @@ private:
         float smoothedGlide = 0.0f;
         float envelopeFollower = 0.0f;
         float envelopeReference = 1.0f;
+        float smoothedShapingGain = 1.0f;
 
         std::atomic<double> pendingSampleRateHz { 44100.0 };
         std::atomic<int> pendingMaxBlock { 512 };
