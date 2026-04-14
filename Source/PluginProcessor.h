@@ -120,9 +120,11 @@ private:
         void setMorphAmount(float amount) noexcept;
         void setFocusAmount(float amount) noexcept;
         void setGlideAmount(float amount) noexcept;
+        void setTransientBypassAmount(float amount) noexcept;
         void setEnvModAmount(float amount) noexcept;
         void setEnvShapeAmount(float amount) noexcept;
         void setEnvSource(int source) noexcept;
+        void setNonRealtimeMode(bool isNonRealtime) noexcept;
         void setSidechainActive(bool isActive) noexcept;
         void run() override;
 
@@ -154,9 +156,11 @@ private:
         std::atomic<float> morphAmount { 0.5f };
         std::atomic<float> focusAmount { 1.0f };
         std::atomic<float> glideAmount { 0.0f };
+        std::atomic<float> transientBypassAmount { 0.0f };
         std::atomic<float> envModAmount { 0.0f };
         std::atomic<float> envShapeAmount { 0.0f };
         std::atomic<int> envSource { 1 }; // 0: Source, 1: Sidechain
+        std::atomic<bool> nonRealtimeMode { false };
         std::atomic<bool> sidechainActive { false };
         double sampleRateHz = 44100.0;
         int maxBlock = 512;
@@ -187,6 +191,8 @@ private:
         std::array<std::array<float, kFftBins>, kMaxChannels> srcPhase {};
         std::array<std::array<float, kFftBins>, kMaxChannels> morphedMagnitude {};
         std::array<std::array<float, kFftBins>, kMaxChannels> prevMorphedMagnitude {};
+        std::array<float, kMaxChannels> prevSrcEnergy {};
+        std::array<float, kMaxChannels> transientEnv {};
 
         std::array<Eigen::VectorXf, kMaxChannels> srcBandsPerChannel;
         std::array<Eigen::VectorXf, kMaxChannels> tgtBandsPerChannel;
@@ -213,6 +219,8 @@ private:
         float envelopeFollower = 0.0f;
         float envelopeReference = 1.0f;
         float smoothedShapingGain = 1.0f;
+        uint64_t framesProcessedSinceReset = 0;
+        uint64_t softStartFramesTotal = 1;
 
         std::atomic<double> pendingSampleRateHz { 44100.0 };
         std::atomic<int> pendingMaxBlock { 512 };
@@ -238,6 +246,7 @@ private:
 
     double currentSampleRate = 44100.0;
     int currentMaxBlockSize = 512;
+    bool wasOfflineLastBlock = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(E1MorphAudioProcessor)
 };
