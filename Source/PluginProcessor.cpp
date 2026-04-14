@@ -10,6 +10,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout E1MorphAudioProcessor::creat
         "Morph",
         juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
         0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "focus",
+        "Sinkhorn Focus",
+        juce::NormalisableRange<float>(0.5f, 2.0f, 0.001f),
+        1.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "glide",
+        "Spectral Glide",
+        juce::NormalisableRange<float>(0.0f, 0.99f, 0.001f),
+        0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "envMod",
+        "Envelope Mod",
+        juce::NormalisableRange<float>(-1.0f, 1.0f, 0.001f),
+        0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "outGain",
+        "Out Gain (dB)",
+        juce::NormalisableRange<float>(-36.0f, 12.0f, 0.01f),
+        0.0f));
     return { params.begin(), params.end() };
 }
 
@@ -169,8 +189,26 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
 
     const juce::AudioBuffer<float>& target = (hasSidechain && !targetIsSilent) ? sidechain : source;
 
+    float morph = 0.0f;
     if (auto* morphParam = apvts.getRawParameterValue("morph"))
-        worker.setMorphAmount(morphParam->load(std::memory_order_relaxed));
+        morph = morphParam->load(std::memory_order_relaxed);
+    worker.setMorphAmount(morph);
+
+    float focus = 1.0f;
+    if (auto* focusParam = apvts.getRawParameterValue("focus"))
+        focus = focusParam->load(std::memory_order_relaxed);
+    worker.setFocusAmount(focus);
+
+    float glide = 0.0f;
+    if (auto* glideParam = apvts.getRawParameterValue("glide"))
+        glide = glideParam->load(std::memory_order_relaxed);
+    worker.setGlideAmount(glide);
+
+    float envMod = 0.0f;
+    if (auto* envModParam = apvts.getRawParameterValue("envMod"))
+        envMod = envModParam->load(std::memory_order_relaxed);
+    worker.setEnvModAmount(envMod);
+    worker.setSidechainActive(hasSidechain && !targetIsSilent);
 
     pushFrameToWorker(source, target);
 
@@ -179,6 +217,21 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
         copyProcessedToOutput(processed, output);
     else
         copySourceToOutput(source, output);
+
+    float outGainDb = 0.0f;
+    if (auto* outGainParam = apvts.getRawParameterValue("outGain"))
+        outGainDb = outGainParam->load(std::memory_order_relaxed);
+
+    const float outGainLin = juce::Decibels::decibelsToGain(outGainDb);
+    for (int ch = 0; ch < output.getNumChannels(); ++ch)
+    {
+        float* out = output.getWritePointer(ch);
+        for (int n = 0; n < numSamples; ++n)
+        {
+            out[n] *= outGainLin;
+            out[n] = juce::jlimit(-1.0f, 1.0f, out[n]);
+        }
+    }
 }
 
 void E1MorphAudioProcessor::pushFrameToWorker(const juce::AudioBuffer<float>& source,
@@ -320,6 +373,26 @@ void E1MorphAudioProcessor::WorkerThread::setMorphAmount(float amount) noexcept
     morphAmount.store(juce::jlimit(0.0f, 1.0f, amount), std::memory_order_relaxed);
 }
 
+void E1MorphAudioProcessor::WorkerThread::setFocusAmount(float amount) noexcept
+{
+    focusAmount.store(juce::jlimit(0.5f, 2.0f, amount), std::memory_order_relaxed);
+}
+
+void E1MorphAudioProcessor::WorkerThread::setGlideAmount(float amount) noexcept
+{
+    glideAmount.store(juce::jlimit(0.0f, 0.99f, amount), std::memory_order_relaxed);
+}
+
+void E1MorphAudioProcessor::WorkerThread::setEnvModAmount(float amount) noexcept
+{
+    envModAmount.store(juce::jlimit(-1.0f, 1.0f, amount), std::memory_order_relaxed);
+}
+
+void E1MorphAudioProcessor::WorkerThread::setSidechainActive(bool isActive) noexcept
+{
+    sidechainActive.store(isActive, std::memory_order_relaxed);
+}
+
 void E1MorphAudioProcessor::WorkerThread::run()
 {
     while (!threadShouldExit())
@@ -365,12 +438,19 @@ void E1MorphAudioProcessor::WorkerThread::resetStreamingState(double sampleRate,
         std::fill(targetInputRing[static_cast<size_t>(ch)].begin(), targetInputRing[static_cast<size_t>(ch)].end(), 0.0f);
         std::fill(outputOlaRing[static_cast<size_t>(ch)].begin(), outputOlaRing[static_cast<size_t>(ch)].end(), 0.0f);
         std::fill(outputNormRing[static_cast<size_t>(ch)].begin(), outputNormRing[static_cast<size_t>(ch)].end(), 0.0f);
+        std::fill(prevMorphedMagnitude[static_cast<size_t>(ch)].begin(), prevMorphedMagnitude[static_cast<size_t>(ch)].end(), 0.0f);
     }
 
     activeChannels = 0;
     inputWriteSample = 0;
     nextFrameStartSample = 0;
     outputReadSample = -kFftSize;
+    smoothedMorph = morphAmount.load(std::memory_order_relaxed);
+    smoothedFocus = focusAmount.load(std::memory_order_relaxed);
+    smoothedGlide = glideAmount.load(std::memory_order_relaxed);
+    envelopeFollower = 0.0f;
+    envelopeReference = 1.0f;
+    sidechainActive.store(false, std::memory_order_relaxed);
 
     AudioFrame throwAwayIn {};
     while (owner.audioToWorkerFifo.pop(throwAwayIn))
@@ -416,23 +496,79 @@ void E1MorphAudioProcessor::WorkerThread::appendInputSamples(const AudioFrame& i
 
 void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
 {
-    const float morph = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
+    constexpr float kParamSmooth = 0.2f;
+    constexpr float kEnvAttack = 0.35f;
+    constexpr float kEnvRelease = 0.08f;
+
+    const float morphTarget = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
+    const float focusTarget = juce::jlimit(0.5f, 2.0f, focusAmount.load(std::memory_order_relaxed));
+    const float glideTarget = juce::jlimit(0.0f, 0.99f, glideAmount.load(std::memory_order_relaxed));
+    const float envMod = juce::jlimit(-1.0f, 1.0f, envModAmount.load(std::memory_order_relaxed));
+
+    smoothedMorph += kParamSmooth * (morphTarget - smoothedMorph);
+    smoothedFocus += kParamSmooth * (focusTarget - smoothedFocus);
+    smoothedGlide += kParamSmooth * (glideTarget - smoothedGlide);
 
     while (inputWriteSample >= (nextFrameStartSample + static_cast<uint64_t>(kFftSize)))
     {
         computeStftMagnitudes(nextFrameStartSample, activeChannels);
 
-        if (morph > 0.0f)
+        if (sidechainActive.load(std::memory_order_relaxed))
+        {
+            const float envInstant = computeTargetEnvelopeFromMagnitudes(activeChannels);
+            const float coeff = (envInstant > envelopeFollower) ? kEnvAttack : kEnvRelease;
+            envelopeFollower += coeff * (envInstant - envelopeFollower);
+        }
+        else
+        {
+            envelopeFollower *= 0.9f;
+        }
+
+        envelopeFollower = juce::jlimit(0.0f, 1.0f, envelopeFollower);
+
+        const float mod = envMod * envelopeFollower;
+        const float effectiveMorph = juce::jlimit(0.0f, 1.0f, smoothedMorph + mod);
+        const float effectiveFocus = juce::jlimit(0.5f, 2.0f, smoothedFocus + (0.5f * mod));
+
+        if (effectiveMorph > 0.0f)
         {
             compressSpectrumToBands();
-            runSinkhornBarycenter(morph);
-            expandBandsToSpectrum();
+            runSinkhornBarycenter(effectiveMorph, effectiveFocus);
+            expandBandsToSpectrum(smoothedGlide);
+        }
+        else
+        {
+            for (int ch = 0; ch < activeChannels; ++ch)
+            {
+                std::copy(srcMagnitude[static_cast<size_t>(ch)].begin(),
+                          srcMagnitude[static_cast<size_t>(ch)].end(),
+                          prevMorphedMagnitude[static_cast<size_t>(ch)].begin());
+            }
         }
 
         synthesizeUsingSourcePhase(nextFrameStartSample, activeChannels);
 
         nextFrameStartSample += static_cast<uint64_t>(kHopSize);
     }
+}
+
+float E1MorphAudioProcessor::WorkerThread::computeTargetEnvelopeFromMagnitudes(int numChannels) noexcept
+{
+    if (numChannels <= 0)
+        return 0.0f;
+
+    float tgtAverageMagnitude = 0.0f;
+    for (int ch = 0; ch < numChannels; ++ch)
+    {
+        const Eigen::Map<const Eigen::ArrayXf> tgtArray(tgtMagnitude[static_cast<size_t>(ch)].data(), kFftBins);
+        tgtAverageMagnitude += tgtArray.sum();
+    }
+
+    tgtAverageMagnitude /= static_cast<float>(numChannels * kFftBins);
+    envelopeReference = juce::jmax(kDistributionFloor, juce::jmax(tgtAverageMagnitude, envelopeReference * 0.995f));
+
+    const float normalized = tgtAverageMagnitude / juce::jmax(kDistributionFloor, envelopeReference);
+    return juce::jlimit(0.0f, 1.0f, normalized);
 }
 
 void E1MorphAudioProcessor::WorkerThread::popOutputSamples(int numChannels, int numSamples, MorphResultFrame& out) noexcept
@@ -542,7 +678,7 @@ void E1MorphAudioProcessor::WorkerThread::compressSpectrumToBands()
     }
 }
 
-void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter(float morph)
+void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter(float morph, float focus)
 {
     if (morph <= 0.0f)
     {
@@ -550,6 +686,8 @@ void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter(float morph)
             baryBandsPerChannel[static_cast<size_t>(ch)] = srcBandsPerChannel[static_cast<size_t>(ch)];
         return;
     }
+
+    const float clampedFocus = juce::jlimit(0.5f, 2.0f, focus);
 
     for (int ch = 0; ch < activeChannels; ++ch)
     {
@@ -581,10 +719,11 @@ void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter(float morph)
         {
             for (int j = 0; j < kCompressedBands; ++j)
             {
-                const float mass = transportPlan(i, j);
+                const float mass = juce::jmax(0.0f, transportPlan(i, j));
+                const float focusedMass = std::pow(mass + kDistributionFloor, clampedFocus);
                 const float targetIdx = ((1.0f - morph) * static_cast<float>(i)) + (morph * static_cast<float>(j));
                 const int k = juce::jlimit(0, kCompressedBands - 1, static_cast<int>(std::lround(targetIdx)));
-                baryBands(k) += mass;
+                baryBands(k) += focusedMass;
             }
         }
 
@@ -598,15 +737,17 @@ void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter(float morph)
     }
 }
 
-void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum()
+void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum(float glide)
 {
     constexpr float denom = static_cast<float>(kFftBins - 1);
     constexpr float bandMax = static_cast<float>(kCompressedBands - 1);
+    const float clampedGlide = juce::jlimit(0.0f, 0.99f, glide);
 
     for (int ch = 0; ch < activeChannels; ++ch)
     {
         const auto& baryBand = baryBandsPerChannel[static_cast<size_t>(ch)];
         const auto& srcBand = srcBandsPerChannel[static_cast<size_t>(ch)];
+        auto& prevBand = prevMorphedMagnitude[static_cast<size_t>(ch)];
 
         for (int bin = 0; bin < kFftBins; ++bin)
         {
@@ -623,9 +764,13 @@ void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum()
             const float interpolatedBary = ((1.0f - frac) * baryV0) + (frac * baryV1);
             const float interpolatedSrc = ((1.0f - frac) * srcV0) + (frac * srcV1);
             const float ratio = interpolatedBary / juce::jmax(kDistributionFloor, interpolatedSrc);
+            const float currentMag = juce::jmax(0.0f,
+                                                srcMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] * ratio);
+            const float smoothedMag = (clampedGlide * prevBand[static_cast<size_t>(bin)])
+                                      + ((1.0f - clampedGlide) * currentMag);
+            prevBand[static_cast<size_t>(bin)] = smoothedMag;
 
-            morphedMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] =
-                srcMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] * ratio;
+            morphedMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] = smoothedMag;
         }
     }
 }

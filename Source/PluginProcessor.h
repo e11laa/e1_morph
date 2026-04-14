@@ -118,6 +118,10 @@ private:
 
         void prepare(double sampleRate, int maxBlockSize) noexcept;
         void setMorphAmount(float amount) noexcept;
+        void setFocusAmount(float amount) noexcept;
+        void setGlideAmount(float amount) noexcept;
+        void setEnvModAmount(float amount) noexcept;
+        void setSidechainActive(bool isActive) noexcept;
         void run() override;
 
     private:
@@ -138,13 +142,18 @@ private:
 
         void computeStftMagnitudes(uint64_t frameStartSample, int numChannels);
         void compressSpectrumToBands();
-        void runSinkhornBarycenter(float morph);
-        void expandBandsToSpectrum();
+        void runSinkhornBarycenter(float morph, float focus);
+        void expandBandsToSpectrum(float glide);
+        float computeTargetEnvelopeFromMagnitudes(int numChannels) noexcept;
         void synthesizeUsingSourcePhase(uint64_t frameStartSample, int numChannels);
         void resetStreamingState(double sampleRate, int maxBlockSize) noexcept;
 
         E1MorphAudioProcessor& owner;
         std::atomic<float> morphAmount { 0.5f };
+        std::atomic<float> focusAmount { 1.0f };
+        std::atomic<float> glideAmount { 0.0f };
+        std::atomic<float> envModAmount { 0.0f };
+        std::atomic<bool> sidechainActive { false };
         double sampleRateHz = 44100.0;
         int maxBlock = 512;
 
@@ -173,6 +182,7 @@ private:
         std::array<std::array<float, kFftBins>, kMaxChannels> tgtMagnitude {};
         std::array<std::array<float, kFftBins>, kMaxChannels> srcPhase {};
         std::array<std::array<float, kFftBins>, kMaxChannels> morphedMagnitude {};
+        std::array<std::array<float, kFftBins>, kMaxChannels> prevMorphedMagnitude {};
 
         std::array<Eigen::VectorXf, kMaxChannels> srcBandsPerChannel;
         std::array<Eigen::VectorXf, kMaxChannels> tgtBandsPerChannel;
@@ -193,6 +203,11 @@ private:
         uint64_t inputWriteSample = 0;
         uint64_t nextFrameStartSample = 0;
         int64_t outputReadSample = -kFftSize;
+        float smoothedMorph = 0.0f;
+        float smoothedFocus = 1.0f;
+        float smoothedGlide = 0.0f;
+        float envelopeFollower = 0.0f;
+        float envelopeReference = 1.0f;
 
         std::atomic<double> pendingSampleRateHz { 44100.0 };
         std::atomic<int> pendingMaxBlock { 512 };
