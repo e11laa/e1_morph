@@ -135,7 +135,7 @@ void E1MorphAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock
     currentMaxBlockSize = juce::jmax(1, samplesPerBlock);
     wasOfflineLastBlock = false;
 
-    setLatencySamples(kFftSize + currentMaxBlockSize);
+    updateLatencyCompensation(isNonRealtime());
 
     worker.prepare(currentSampleRate, currentMaxBlockSize);
 }
@@ -182,6 +182,7 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     juce::ScopedNoDenormals noDenormals;
 
     const bool isOffline = isNonRealtime();
+    updateLatencyCompensation(isOffline);
 
     const int numSamples = buffer.getNumSamples();
     for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
@@ -192,12 +193,24 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
 
     if (isOffline && !wasOfflineLastBlock)
     {
+        if (worker.isThreadRunning())
+        {
+            worker.signalThreadShouldExit();
+            worker.waitForThreadToExit(2000);
+        }
+
         worker.setNonRealtimeMode(true);
         worker.prepare(currentSampleRate, currentMaxBlockSize);
-        output.clear();
-        wasOfflineLastBlock = true;
-        return;
     }
+    else if (!isOffline && wasOfflineLastBlock)
+    {
+        if (!worker.isThreadRunning())
+            worker.startThread(juce::Thread::Priority::normal);
+
+        worker.setNonRealtimeMode(false);
+        worker.prepare(currentSampleRate, currentMaxBlockSize);
+    }
+
     wasOfflineLastBlock = isOffline;
 
     const bool hasSidechain = (getBusCount(true) > 1 && getChannelCountOfBus(true, 1) > 0);
@@ -242,13 +255,32 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     worker.setNonRealtimeMode(isOffline);
     worker.setSidechainActive(hasSidechain);
 
-    pushFrameToWorker(source, target);
+    if (isOffline)
+    {
+        AudioFrame frame {};
+        buildInputFrame(source, target, frame);
 
-    MorphResultFrame processed {};
-    if (popProcessedFrame(processed))
+        MorphResultFrame processed {};
+        processed.sequence = frame.sequence;
+        processed.numChannels = frame.numChannels;
+        processed.numSamples = frame.numSamples;
+
+        worker.processOneFrame(frame, processed);
         copyProcessedToOutput(processed, output);
+    }
     else
-        copySourceToOutput(source, output);
+    {
+        if (!worker.isThreadRunning())
+            worker.startThread(juce::Thread::Priority::normal);
+
+        pushFrameToWorker(source, target);
+
+        MorphResultFrame processed {};
+        if (popProcessedFrame(processed))
+            copyProcessedToOutput(processed, output);
+        else
+            copySourceToOutput(source, output);
+    }
 
     float outGainDb = 0.0f;
     if (auto* outGainParam = apvts.getRawParameterValue("outGain"))
@@ -268,10 +300,11 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     }
 }
 
-void E1MorphAudioProcessor::pushFrameToWorker(const juce::AudioBuffer<float>& source,
-                                              const juce::AudioBuffer<float>& target) noexcept
+void E1MorphAudioProcessor::buildInputFrame(const juce::AudioBuffer<float>& source,
+                                            const juce::AudioBuffer<float>& target,
+                                            AudioFrame& frame) noexcept
 {
-    AudioFrame frame {};
+    frame = {};
     frame.sequence = sequenceCounter.fetch_add(1, std::memory_order_relaxed);
     frame.numChannels = juce::jmin(kMaxChannels, source.getNumChannels());
     frame.numSamples = juce::jmin(kMaxBlockSamples, source.getNumSamples());
@@ -282,14 +315,34 @@ void E1MorphAudioProcessor::pushFrameToWorker(const juce::AudioBuffer<float>& so
                     source.getReadPointer(ch),
                     sizeof(float) * static_cast<size_t>(frame.numSamples));
 
-        const int targetCh = (target.getNumChannels() > 0)
-                                 ? juce::jmin(ch, target.getNumChannels() - 1)
-                                 : 0;
-
-        std::memcpy(frame.target[static_cast<size_t>(ch)].data(),
-                    target.getReadPointer(targetCh),
-                    sizeof(float) * static_cast<size_t>(frame.numSamples));
+        if (target.getNumChannels() > 0)
+        {
+            const int targetCh = juce::jmin(ch, target.getNumChannels() - 1);
+            std::memcpy(frame.target[static_cast<size_t>(ch)].data(),
+                        target.getReadPointer(targetCh),
+                        sizeof(float) * static_cast<size_t>(frame.numSamples));
+        }
+        else
+        {
+            std::fill(frame.target[static_cast<size_t>(ch)].begin(),
+                      frame.target[static_cast<size_t>(ch)].begin() + frame.numSamples,
+                      0.0f);
+        }
     }
+}
+
+void E1MorphAudioProcessor::updateLatencyCompensation(bool isOffline) noexcept
+{
+    const int desiredLatency = isOffline ? kFftSize : (kFftSize + currentMaxBlockSize);
+    if (getLatencySamples() != desiredLatency)
+        setLatencySamples(desiredLatency);
+}
+
+void E1MorphAudioProcessor::pushFrameToWorker(const juce::AudioBuffer<float>& source,
+                                              const juce::AudioBuffer<float>& target) noexcept
+{
+    AudioFrame frame {};
+    buildInputFrame(source, target, frame);
 
     if (!audioToWorkerFifo.push(frame))
     {
@@ -397,8 +450,19 @@ E1MorphAudioProcessor::WorkerThread::~WorkerThread()
 
 void E1MorphAudioProcessor::WorkerThread::prepare(double sampleRate, int maxBlockSize) noexcept
 {
-    pendingSampleRateHz.store((sampleRate > 0.0) ? sampleRate : 44100.0, std::memory_order_relaxed);
-    pendingMaxBlock.store(juce::jmax(1, maxBlockSize), std::memory_order_relaxed);
+    const double sanitizedSampleRate = (sampleRate > 0.0) ? sampleRate : 44100.0;
+    const int sanitizedMaxBlock = juce::jmax(1, maxBlockSize);
+
+    pendingSampleRateHz.store(sanitizedSampleRate, std::memory_order_relaxed);
+    pendingMaxBlock.store(sanitizedMaxBlock, std::memory_order_relaxed);
+
+    if (!isThreadRunning())
+    {
+        prepareRequested.store(false, std::memory_order_release);
+        resetStreamingState(sanitizedSampleRate, sanitizedMaxBlock);
+        return;
+    }
+
     prepareRequested.store(true, std::memory_order_release);
 }
 

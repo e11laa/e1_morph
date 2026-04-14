@@ -126,6 +126,7 @@ private:
         void setEnvSource(int source) noexcept;
         void setNonRealtimeMode(bool isNonRealtime) noexcept;
         void setSidechainActive(bool isActive) noexcept;
+        void processOneFrame(const AudioFrame& in, MorphResultFrame& out);
         void run() override;
 
     private:
@@ -139,7 +140,6 @@ private:
 
         using Cpx = std::complex<float>;
 
-        void processOneFrame(const AudioFrame& in, MorphResultFrame& out);
         void appendInputSamples(const AudioFrame& in);
         void renderAvailableStftFrames();
         void popOutputSamples(int numChannels, int numSamples, MorphResultFrame& out) noexcept;
@@ -226,6 +226,11 @@ private:
         std::atomic<int> pendingMaxBlock { 512 };
         std::atomic<bool> prepareRequested { true };
     };
+
+    void buildInputFrame(const juce::AudioBuffer<float>& source,
+                         const juce::AudioBuffer<float>& target,
+                         AudioFrame& frame) noexcept;
+    void updateLatencyCompensation(bool isOffline) noexcept;
 
     void pushFrameToWorker(const juce::AudioBuffer<float>& source,
                            const juce::AudioBuffer<float>& target) noexcept;
