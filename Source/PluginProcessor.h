@@ -121,8 +121,8 @@ private:
         void setFocusAmount(float amount) noexcept;
         void setGlideAmount(float amount) noexcept;
         void setEnvModAmount(float amount) noexcept;
-        void setEnvFollowMode(int mode) noexcept;
-        void setEnvFollowSource(int source) noexcept;
+        void setEnvShapeAmount(float amount) noexcept;
+        void setEnvSource(int source) noexcept;
         void setSidechainActive(bool isActive) noexcept;
         void run() override;
 
@@ -155,8 +155,8 @@ private:
         std::atomic<float> focusAmount { 1.0f };
         std::atomic<float> glideAmount { 0.0f };
         std::atomic<float> envModAmount { 0.0f };
-        std::atomic<int> envFollowMode { 0 };   // 0: Modulation, 1: Shaping
-        std::atomic<int> envFollowSource { 1 }; // 0: Source, 1: Sidechain
+        std::atomic<float> envShapeAmount { 0.0f };
+        std::atomic<int> envSource { 1 }; // 0: Source, 1: Sidechain
         std::atomic<bool> sidechainActive { false };
         double sampleRateHz = 44100.0;
         int maxBlock = 512;
