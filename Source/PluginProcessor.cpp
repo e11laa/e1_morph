@@ -147,14 +147,27 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     juce::ignoreUnused(midiMessages);
     juce::ScopedNoDenormals noDenormals;
 
+    const int numSamples = buffer.getNumSamples();
+    for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
+        buffer.clear(ch, 0, numSamples);
+
     auto source = getBusBuffer(buffer, true, 0);
     auto output = getBusBuffer(buffer, false, 0);
 
-    for (int ch = output.getNumChannels(); ch < buffer.getNumChannels(); ++ch)
-        buffer.clear(ch, 0, buffer.getNumSamples());
-
     const bool hasSidechain = (getBusCount(true) > 1 && getChannelCountOfBus(true, 1) > 0);
-    const auto target = hasSidechain ? getBusBuffer(buffer, true, 1) : source;
+    const auto sidechain = hasSidechain ? getBusBuffer(buffer, true, 1) : juce::AudioBuffer<float> {};
+
+    bool targetIsSilent = !hasSidechain;
+    if (hasSidechain && sidechain.getNumChannels() > 0 && sidechain.getNumSamples() > 0)
+    {
+        float maxMagnitude = 0.0f;
+        for (int ch = 0; ch < sidechain.getNumChannels(); ++ch)
+            maxMagnitude = juce::jmax(maxMagnitude, sidechain.getMagnitude(ch, 0, sidechain.getNumSamples()));
+
+        targetIsSilent = (maxMagnitude <= 1.0e-4f);
+    }
+
+    const juce::AudioBuffer<float>& target = (hasSidechain && !targetIsSilent) ? sidechain : source;
 
     if (auto* morphParam = apvts.getRawParameterValue("morph"))
         worker.setMorphAmount(morphParam->load(std::memory_order_relaxed));
