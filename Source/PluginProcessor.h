@@ -114,8 +114,7 @@ private:
         explicit WorkerThread(E1MorphAudioProcessor& ownerRef);
         ~WorkerThread() override;
 
-        void start(double sampleRate, int maxBlockSize);
-        void stop();
+        void prepare(double sampleRate, int maxBlockSize) noexcept;
         void setMorphAmount(float amount) noexcept;
         void run() override;
 
@@ -123,6 +122,9 @@ private:
         static constexpr int kHopSize = kFftSize / 4;
         static constexpr int kRingSize = 1 << 17;
         static constexpr int kRingMask = kRingSize - 1;
+        static constexpr int kSinkhornIterations = 20;
+        static constexpr float kDistributionFloor = 1.0e-6f;
+        static constexpr float kSinkhornEpsilon = 10.0f;
         static_assert((kRingSize & (kRingSize - 1)) == 0, "kRingSize must be power-of-two");
 
         using Cpx = std::complex<float>;
@@ -137,6 +139,7 @@ private:
         void runSinkhornBarycenter();
         void expandBandsToSpectrum();
         void synthesizeUsingSourcePhase(uint64_t frameStartSample, int numChannels);
+        void resetStreamingState(double sampleRate, int maxBlockSize) noexcept;
 
         E1MorphAudioProcessor& owner;
         std::atomic<float> morphAmount { 0.5f };
@@ -169,18 +172,29 @@ private:
         std::array<std::array<float, kFftBins>, kMaxChannels> srcPhase {};
         std::array<std::array<float, kFftBins>, kMaxChannels> morphedMagnitude {};
 
+        std::array<Eigen::VectorXf, kMaxChannels> srcBandsPerChannel;
+        std::array<Eigen::VectorXf, kMaxChannels> tgtBandsPerChannel;
+        std::array<Eigen::VectorXf, kMaxChannels> baryBandsPerChannel;
+
         Eigen::VectorXf srcBands;
         Eigen::VectorXf tgtBands;
         Eigen::VectorXf baryBands;
         Eigen::MatrixXf costMatrix;
         Eigen::MatrixXf kernelK;
+        Eigen::MatrixXf transportPlan;
         Eigen::VectorXf u;
         Eigen::VectorXf v;
+        Eigen::VectorXf tmpKv;
+        Eigen::VectorXf tmpKTu;
 
         int activeChannels = 0;
         uint64_t inputWriteSample = 0;
         uint64_t nextFrameStartSample = 0;
         int64_t outputReadSample = -kFftSize;
+
+        std::atomic<double> pendingSampleRateHz { 44100.0 };
+        std::atomic<int> pendingMaxBlock { 512 };
+        std::atomic<bool> prepareRequested { true };
     };
 
     void pushFrameToWorker(const juce::AudioBuffer<float>& source,

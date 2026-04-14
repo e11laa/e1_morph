@@ -1,5 +1,7 @@
 #include "PluginProcessor.h"
 
+#include <cmath>
+
 E1MorphAudioProcessor::E1MorphAudioProcessor()
     : AudioProcessor(BusesProperties()
 #if !JucePlugin_IsMidiEffect
@@ -11,11 +13,13 @@ E1MorphAudioProcessor::E1MorphAudioProcessor()
 #endif
       )
 {
+    worker.startThread(juce::Thread::Priority::normal);
 }
 
 E1MorphAudioProcessor::~E1MorphAudioProcessor()
 {
-    worker.stop();
+    worker.signalThreadShouldExit();
+    worker.waitForThreadToExit(2000);
 }
 
 const juce::String E1MorphAudioProcessor::getName() const
@@ -80,23 +84,19 @@ void E1MorphAudioProcessor::changeProgramName(int, const juce::String&)
 
 void E1MorphAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    currentSampleRate = sampleRate;
-    currentMaxBlockSize = samplesPerBlock;
-
-    audioToWorkerFifo.reset();
-    workerToAudioFifo.reset();
+    currentSampleRate = (sampleRate > 0.0) ? sampleRate : 44100.0;
+    currentMaxBlockSize = juce::jmax(1, samplesPerBlock);
 
     const int analysisSynthesisLatency = kFftSize;
     const int queueSafety = juce::jmax(0, currentMaxBlockSize);
     setLatencySamples(analysisSynthesisLatency + queueSafety);
 
-    worker.start(sampleRate, samplesPerBlock);
+    worker.prepare(currentSampleRate, currentMaxBlockSize);
 }
 
 void E1MorphAudioProcessor::releaseResources()
 {
-    worker.stop();
-    setLatencySamples(0);
+    // Thread lifetime is managed by processor constructor/destructor.
 }
 
 bool E1MorphAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -239,52 +239,52 @@ E1MorphAudioProcessor::WorkerThread::WorkerThread(E1MorphAudioProcessor& ownerRe
     : juce::Thread("OTMorphWorker")
     , owner(ownerRef)
 {
-}
+    srcBands.setZero(kCompressedBands);
+    tgtBands.setZero(kCompressedBands);
+    baryBands.setZero(kCompressedBands);
+    costMatrix.setZero(kCompressedBands, kCompressedBands);
+    kernelK.setZero(kCompressedBands, kCompressedBands);
+    transportPlan.setZero(kCompressedBands, kCompressedBands);
+    u.setOnes(kCompressedBands);
+    v.setOnes(kCompressedBands);
+    tmpKv.setZero(kCompressedBands);
+    tmpKTu.setZero(kCompressedBands);
 
-E1MorphAudioProcessor::WorkerThread::~WorkerThread()
-{
-    stop();
-}
+    for (int ch = 0; ch < kMaxChannels; ++ch)
+    {
+        srcBandsPerChannel[static_cast<size_t>(ch)].setConstant(kCompressedBands, kDistributionFloor);
+        tgtBandsPerChannel[static_cast<size_t>(ch)].setConstant(kCompressedBands, kDistributionFloor);
+        baryBandsPerChannel[static_cast<size_t>(ch)].setConstant(kCompressedBands, kDistributionFloor);
+    }
 
-void E1MorphAudioProcessor::WorkerThread::start(double sampleRate, int maxBlockSize)
-{
-    sampleRateHz = sampleRate;
-    maxBlock = maxBlockSize;
-
-    srcBands = Eigen::VectorXf::Zero(kCompressedBands);
-    tgtBands = Eigen::VectorXf::Zero(kCompressedBands);
-    baryBands = Eigen::VectorXf::Zero(kCompressedBands);
-    costMatrix = Eigen::MatrixXf::Zero(kCompressedBands, kCompressedBands);
-    kernelK = Eigen::MatrixXf::Ones(kCompressedBands, kCompressedBands);
-    u = Eigen::VectorXf::Ones(kCompressedBands);
-    v = Eigen::VectorXf::Ones(kCompressedBands);
+    for (int i = 0; i < kCompressedBands; ++i)
+    {
+        for (int j = 0; j < kCompressedBands; ++j)
+        {
+            const float d = static_cast<float>(i - j);
+            const float dist2 = d * d;
+            costMatrix(i, j) = dist2;
+            kernelK(i, j) = std::exp(-dist2 / kSinkhornEpsilon);
+        }
+    }
 
     window.fill(1.0f);
     hannWindow.multiplyWithWindowingTable(window.data(), kFftSize);
     for (int i = 0; i < kFftSize; ++i)
         windowSquared[static_cast<size_t>(i)] = window[static_cast<size_t>(i)] * window[static_cast<size_t>(i)];
 
-    for (int ch = 0; ch < kMaxChannels; ++ch)
-    {
-        std::fill(sourceInputRing[static_cast<size_t>(ch)].begin(), sourceInputRing[static_cast<size_t>(ch)].end(), 0.0f);
-        std::fill(targetInputRing[static_cast<size_t>(ch)].begin(), targetInputRing[static_cast<size_t>(ch)].end(), 0.0f);
-        std::fill(outputOlaRing[static_cast<size_t>(ch)].begin(), outputOlaRing[static_cast<size_t>(ch)].end(), 0.0f);
-        std::fill(outputNormRing[static_cast<size_t>(ch)].begin(), outputNormRing[static_cast<size_t>(ch)].end(), 0.0f);
-    }
-
-    activeChannels = 0;
-    inputWriteSample = 0;
-    nextFrameStartSample = 0;
-    outputReadSample = -kFftSize;
-
-    if (!isThreadRunning())
-        startThread(juce::Thread::Priority::normal);
+    resetStreamingState(sampleRateHz, maxBlock);
 }
 
-void E1MorphAudioProcessor::WorkerThread::stop()
+E1MorphAudioProcessor::WorkerThread::~WorkerThread()
 {
-    signalThreadShouldExit();
-    waitForThreadToExit(2000);
+}
+
+void E1MorphAudioProcessor::WorkerThread::prepare(double sampleRate, int maxBlockSize) noexcept
+{
+    pendingSampleRateHz.store((sampleRate > 0.0) ? sampleRate : 44100.0, std::memory_order_relaxed);
+    pendingMaxBlock.store(juce::jmax(1, maxBlockSize), std::memory_order_relaxed);
+    prepareRequested.store(true, std::memory_order_release);
 }
 
 void E1MorphAudioProcessor::WorkerThread::setMorphAmount(float amount) noexcept
@@ -296,6 +296,13 @@ void E1MorphAudioProcessor::WorkerThread::run()
 {
     while (!threadShouldExit())
     {
+        if (prepareRequested.exchange(false, std::memory_order_acq_rel))
+        {
+            const auto newSampleRate = pendingSampleRateHz.load(std::memory_order_relaxed);
+            const auto newMaxBlock = pendingMaxBlock.load(std::memory_order_relaxed);
+            resetStreamingState(newSampleRate, newMaxBlock);
+        }
+
         AudioFrame in {};
         if (!owner.audioToWorkerFifo.pop(in))
         {
@@ -316,6 +323,35 @@ void E1MorphAudioProcessor::WorkerThread::run()
             owner.workerToAudioFifo.pop(throwAway);
             owner.workerToAudioFifo.push(out);
         }
+    }
+}
+
+void E1MorphAudioProcessor::WorkerThread::resetStreamingState(double sampleRate, int maxBlockSize) noexcept
+{
+    sampleRateHz = (sampleRate > 0.0) ? sampleRate : 44100.0;
+    maxBlock = juce::jmax(1, maxBlockSize);
+
+    for (int ch = 0; ch < kMaxChannels; ++ch)
+    {
+        std::fill(sourceInputRing[static_cast<size_t>(ch)].begin(), sourceInputRing[static_cast<size_t>(ch)].end(), 0.0f);
+        std::fill(targetInputRing[static_cast<size_t>(ch)].begin(), targetInputRing[static_cast<size_t>(ch)].end(), 0.0f);
+        std::fill(outputOlaRing[static_cast<size_t>(ch)].begin(), outputOlaRing[static_cast<size_t>(ch)].end(), 0.0f);
+        std::fill(outputNormRing[static_cast<size_t>(ch)].begin(), outputNormRing[static_cast<size_t>(ch)].end(), 0.0f);
+    }
+
+    activeChannels = 0;
+    inputWriteSample = 0;
+    nextFrameStartSample = 0;
+    outputReadSample = -kFftSize;
+
+    AudioFrame throwAwayIn {};
+    while (owner.audioToWorkerFifo.pop(throwAwayIn))
+    {
+    }
+
+    MorphResultFrame throwAwayOut {};
+    while (owner.workerToAudioFifo.pop(throwAwayOut))
+    {
     }
 }
 
@@ -433,23 +469,132 @@ void E1MorphAudioProcessor::WorkerThread::computeStftMagnitudes(uint64_t frameSt
 
 void E1MorphAudioProcessor::WorkerThread::compressSpectrumToBands()
 {
-    // TODO Step 3: Downsample FFT bins to Mel/Bark bands.
+    for (int ch = 0; ch < activeChannels; ++ch)
+    {
+        auto& srcBand = srcBandsPerChannel[static_cast<size_t>(ch)];
+        auto& tgtBand = tgtBandsPerChannel[static_cast<size_t>(ch)];
+
+        srcBand.setConstant(kDistributionFloor);
+        tgtBand.setConstant(kDistributionFloor);
+
+        for (int band = 0; band < kCompressedBands; ++band)
+        {
+            const int start = (band * kFftBins) / kCompressedBands;
+            const int end = ((band + 1) * kFftBins) / kCompressedBands;
+            const int clampedEnd = juce::jmax(start + 1, end);
+            const int count = clampedEnd - start;
+
+            float srcAccum = 0.0f;
+            float tgtAccum = 0.0f;
+            for (int bin = start; bin < clampedEnd; ++bin)
+            {
+                srcAccum += srcMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)];
+                tgtAccum += tgtMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)];
+            }
+
+            srcBand(band) = juce::jmax(kDistributionFloor, srcAccum / static_cast<float>(count));
+            tgtBand(band) = juce::jmax(kDistributionFloor, tgtAccum / static_cast<float>(count));
+        }
+
+        const float srcSum = juce::jmax(kDistributionFloor, srcBand.sum());
+        float tgtSum = tgtBand.sum();
+        if (tgtSum <= kDistributionFloor)
+        {
+            tgtBand.setConstant(kDistributionFloor);
+            tgtSum = tgtBand.sum();
+        }
+
+        const float scale = srcSum / juce::jmax(kDistributionFloor, tgtSum);
+        tgtBand *= scale;
+    }
 }
 
 void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter()
 {
-    // TODO Step 3: Run Sinkhorn iterations with Eigen.
+    const float morph = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
+
+    if (morph <= 0.0f)
+    {
+        for (int ch = 0; ch < activeChannels; ++ch)
+            baryBandsPerChannel[static_cast<size_t>(ch)] = srcBandsPerChannel[static_cast<size_t>(ch)];
+        return;
+    }
+
+    for (int ch = 0; ch < activeChannels; ++ch)
+    {
+        srcBands = srcBandsPerChannel[static_cast<size_t>(ch)];
+        tgtBands = tgtBandsPerChannel[static_cast<size_t>(ch)];
+
+        u.setOnes();
+        v.setOnes();
+
+        for (int iter = 0; iter < kSinkhornIterations; ++iter)
+        {
+            tmpKv.noalias() = kernelK * v;
+            u = srcBands.array() / tmpKv.array().max(kDistributionFloor);
+
+            tmpKTu.noalias() = kernelK.transpose() * u;
+            v = tgtBands.array() / tmpKTu.array().max(kDistributionFloor);
+        }
+
+        transportPlan.setZero();
+        for (int i = 0; i < kCompressedBands; ++i)
+        {
+            const float ui = u(i);
+            for (int j = 0; j < kCompressedBands; ++j)
+                transportPlan(i, j) = ui * kernelK(i, j) * v(j);
+        }
+
+        baryBands.setZero();
+        for (int i = 0; i < kCompressedBands; ++i)
+        {
+            for (int j = 0; j < kCompressedBands; ++j)
+            {
+                const float mass = transportPlan(i, j);
+                const float targetIdx = ((1.0f - morph) * static_cast<float>(i)) + (morph * static_cast<float>(j));
+                const int k = juce::jlimit(0, kCompressedBands - 1, static_cast<int>(std::lround(targetIdx)));
+                baryBands(k) += mass;
+            }
+        }
+
+        baryBands = baryBands.array().max(kDistributionFloor);
+
+        const float srcSum = juce::jmax(kDistributionFloor, srcBands.sum());
+        const float barySum = juce::jmax(kDistributionFloor, baryBands.sum());
+        baryBands *= (srcSum / barySum);
+
+        baryBandsPerChannel[static_cast<size_t>(ch)] = baryBands;
+    }
 }
 
 void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum()
 {
-    // TODO Step 3: Upsample morphed bands back to FFT bins.
+    constexpr float denom = static_cast<float>(kFftBins - 1);
+    constexpr float bandMax = static_cast<float>(kCompressedBands - 1);
+
+    for (int ch = 0; ch < activeChannels; ++ch)
+    {
+        const auto& baryBand = baryBandsPerChannel[static_cast<size_t>(ch)];
+
+        for (int bin = 0; bin < kFftBins; ++bin)
+        {
+            const float pos = (static_cast<float>(bin) / denom) * bandMax;
+            const int i0 = juce::jlimit(0, kCompressedBands - 1, static_cast<int>(std::floor(pos)));
+            const int i1 = juce::jmin(kCompressedBands - 1, i0 + 1);
+            const float frac = pos - static_cast<float>(i0);
+
+            const float v0 = baryBand(i0);
+            const float v1 = baryBand(i1);
+            const float interpolated = ((1.0f - frac) * v0) + (frac * v1);
+
+            morphedMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] =
+                juce::jmax(kDistributionFloor, interpolated);
+        }
+    }
 }
 
 void E1MorphAudioProcessor::WorkerThread::synthesizeUsingSourcePhase(uint64_t frameStartSample, int numChannels)
 {
-    constexpr float invFftSize = 1.0f / static_cast<float>(kFftSize);
-
     for (int ch = 0; ch < numChannels; ++ch)
     {
         auto& spec = resynthSpec[static_cast<size_t>(ch)];
@@ -474,7 +619,7 @@ void E1MorphAudioProcessor::WorkerThread::synthesizeUsingSourcePhase(uint64_t fr
 
         for (int n = 0; n < kFftSize; ++n)
         {
-            const float timeSample = ifftTime[static_cast<size_t>(ch)][static_cast<size_t>(n)].real() * invFftSize;
+            const float timeSample = ifftTime[static_cast<size_t>(ch)][static_cast<size_t>(n)].real();
             const float w = window[static_cast<size_t>(n)];
             const size_t ringPos = static_cast<size_t>((frameStartSample + static_cast<uint64_t>(n)) & kRingMask);
 

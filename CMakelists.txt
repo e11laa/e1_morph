@@ -47,3 +47,5 @@ target_link_libraries(E1Morph PRIVATE
     juce::juce_dsp
     Eigen3::Eigen
 )
+
+juce_generate_juce_header(E1Morph)
