@@ -108,6 +108,8 @@ public:
     void setStateInformation(const void* data, int sizeInBytes) override;
 
 private:
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
     class WorkerThread final : public juce::Thread
     {
     public:
@@ -136,7 +138,7 @@ private:
 
         void computeStftMagnitudes(uint64_t frameStartSample, int numChannels);
         void compressSpectrumToBands();
-        void runSinkhornBarycenter();
+        void runSinkhornBarycenter(float morph);
         void expandBandsToSpectrum();
         void synthesizeUsingSourcePhase(uint64_t frameStartSample, int numChannels);
         void resetStreamingState(double sampleRate, int maxBlockSize) noexcept;
@@ -208,6 +210,7 @@ private:
     LockFreeFifo<AudioFrame, kAudioToWorkerCapacity> audioToWorkerFifo;
     LockFreeFifo<MorphResultFrame, kWorkerToAudioCapacity> workerToAudioFifo;
 
+    juce::AudioProcessorValueTreeState apvts;
     WorkerThread worker { *this };
 
     std::atomic<float> uiMorphAmount { 0.5f };

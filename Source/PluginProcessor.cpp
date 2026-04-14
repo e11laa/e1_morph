@@ -2,6 +2,17 @@
 
 #include <cmath>
 
+juce::AudioProcessorValueTreeState::ParameterLayout E1MorphAudioProcessor::createParameterLayout()
+{
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "morph",
+        "Morph",
+        juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
+        0.0f));
+    return { params.begin(), params.end() };
+}
+
 E1MorphAudioProcessor::E1MorphAudioProcessor()
     : AudioProcessor(BusesProperties()
 #if !JucePlugin_IsMidiEffect
@@ -12,6 +23,7 @@ E1MorphAudioProcessor::E1MorphAudioProcessor()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)
 #endif
       )
+    , apvts(*this, nullptr, "PARAMETERS", createParameterLayout())
 {
     worker.startThread(juce::Thread::Priority::normal);
 }
@@ -143,6 +155,9 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
 
     const bool hasSidechain = (getBusCount(true) > 1 && getChannelCountOfBus(true, 1) > 0);
     const auto target = hasSidechain ? getBusBuffer(buffer, true, 1) : source;
+
+    if (auto* morphParam = apvts.getRawParameterValue("morph"))
+        worker.setMorphAmount(morphParam->load(std::memory_order_relaxed));
 
     pushFrameToWorker(source, target);
 
@@ -388,13 +403,18 @@ void E1MorphAudioProcessor::WorkerThread::appendInputSamples(const AudioFrame& i
 
 void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
 {
+    const float morph = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
+
     while (inputWriteSample >= (nextFrameStartSample + static_cast<uint64_t>(kFftSize)))
     {
         computeStftMagnitudes(nextFrameStartSample, activeChannels);
 
-        compressSpectrumToBands();
-        runSinkhornBarycenter();
-        expandBandsToSpectrum();
+        if (morph > 0.0f)
+        {
+            compressSpectrumToBands();
+            runSinkhornBarycenter(morph);
+            expandBandsToSpectrum();
+        }
 
         synthesizeUsingSourcePhase(nextFrameStartSample, activeChannels);
 
@@ -509,10 +529,8 @@ void E1MorphAudioProcessor::WorkerThread::compressSpectrumToBands()
     }
 }
 
-void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter()
+void E1MorphAudioProcessor::WorkerThread::runSinkhornBarycenter(float morph)
 {
-    const float morph = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
-
     if (morph <= 0.0f)
     {
         for (int ch = 0; ch < activeChannels; ++ch)
@@ -575,6 +593,7 @@ void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum()
     for (int ch = 0; ch < activeChannels; ++ch)
     {
         const auto& baryBand = baryBandsPerChannel[static_cast<size_t>(ch)];
+        const auto& srcBand = srcBandsPerChannel[static_cast<size_t>(ch)];
 
         for (int bin = 0; bin < kFftBins; ++bin)
         {
@@ -583,12 +602,17 @@ void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum()
             const int i1 = juce::jmin(kCompressedBands - 1, i0 + 1);
             const float frac = pos - static_cast<float>(i0);
 
-            const float v0 = baryBand(i0);
-            const float v1 = baryBand(i1);
-            const float interpolated = ((1.0f - frac) * v0) + (frac * v1);
+            const float baryV0 = baryBand(i0);
+            const float baryV1 = baryBand(i1);
+            const float srcV0 = srcBand(i0);
+            const float srcV1 = srcBand(i1);
+
+            const float interpolatedBary = ((1.0f - frac) * baryV0) + (frac * baryV1);
+            const float interpolatedSrc = ((1.0f - frac) * srcV0) + (frac * srcV1);
+            const float ratio = interpolatedBary / juce::jmax(kDistributionFloor, interpolatedSrc);
 
             morphedMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] =
-                juce::jmax(kDistributionFloor, interpolated);
+                srcMagnitude[static_cast<size_t>(ch)][static_cast<size_t>(bin)] * ratio;
         }
     }
 }
