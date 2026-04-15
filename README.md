@@ -1,6 +1,6 @@
 # E1Morph
 
-THE NEWEST VST BUILD DOWNLOAD : https://www.mediafire.com/file/fjmhjlu7ojw4ibs/E1Morph.vst3/file
+THE LATEST VST3 BUILD DOWNLOAD : https://www.mediafire.com/file/fjmhjlu7ojw4ibs/E1Morph.vst3/file
 
 E1Morph is a JUCE-based spectral morphing audio plugin (VST3 + Standalone).
 It morphs a source input toward a sidechain target using 1D Optimal Transport
