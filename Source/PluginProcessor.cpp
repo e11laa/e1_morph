@@ -305,7 +305,7 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     if (auto* outGainParam = apvts.getRawParameterValue("outGain"))
         outGainDb = outGainParam->load(std::memory_order_relaxed);
 
-    constexpr float kInternalSafetyPad = 0.5f; // -6 dB
+    constexpr float kInternalSafetyPad = 0.25f; // -6 dB
     const float outGainLin = juce::Decibels::decibelsToGain(outGainDb);
     const float combinedGain = kInternalSafetyPad * outGainLin;
     for (int ch = 0; ch < output.getNumChannels(); ++ch)
