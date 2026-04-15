@@ -120,6 +120,7 @@ private:
         void setMorphAmount(float amount) noexcept;
         void setFocusAmount(float amount) noexcept;
         void setGlideAmount(float amount) noexcept;
+        void setSpectralFlatteningAmount(float amount) noexcept;
         void setTransientBypassAmount(float amount) noexcept;
         void setEnvModAmount(float amount) noexcept;
         void setEnvShapeAmount(float amount) noexcept;
@@ -156,6 +157,7 @@ private:
         std::atomic<float> morphAmount { 0.5f };
         std::atomic<float> focusAmount { 1.0f };
         std::atomic<float> glideAmount { 0.0f };
+        std::atomic<float> spectralFlatteningAmount { 0.0f };
         std::atomic<float> transientBypassAmount { 0.0f };
         std::atomic<float> envModAmount { 0.0f };
         std::atomic<float> envShapeAmount { 0.0f };

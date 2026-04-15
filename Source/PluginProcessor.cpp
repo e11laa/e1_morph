@@ -21,6 +21,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout E1MorphAudioProcessor::creat
         juce::NormalisableRange<float>(0.0f, 0.99f, 0.001f),
         0.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "spectralFlattening",
+        "Spectral Flattening",
+        juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
+        0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
         "transientBypass",
         "Transient Bypass",
         juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
@@ -231,6 +236,11 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     if (auto* glideParam = apvts.getRawParameterValue("glide"))
         glide = glideParam->load(std::memory_order_relaxed);
     worker.setGlideAmount(glide);
+
+    float spectralFlattening = 0.0f;
+    if (auto* spectralFlatteningParam = apvts.getRawParameterValue("spectralFlattening"))
+        spectralFlattening = spectralFlatteningParam->load(std::memory_order_relaxed);
+    worker.setSpectralFlatteningAmount(spectralFlattening);
 
     float transientBypass = 0.0f;
     if (auto* transientBypassParam = apvts.getRawParameterValue("transientBypass"))
@@ -479,6 +489,11 @@ void E1MorphAudioProcessor::WorkerThread::setFocusAmount(float amount) noexcept
 void E1MorphAudioProcessor::WorkerThread::setGlideAmount(float amount) noexcept
 {
     glideAmount.store(juce::jlimit(0.0f, 0.99f, amount), std::memory_order_relaxed);
+}
+
+void E1MorphAudioProcessor::WorkerThread::setSpectralFlatteningAmount(float amount) noexcept
+{
+    spectralFlatteningAmount.store(juce::jlimit(0.0f, 1.0f, amount), std::memory_order_relaxed);
 }
 
 void E1MorphAudioProcessor::WorkerThread::setTransientBypassAmount(float amount) noexcept
@@ -872,6 +887,10 @@ void E1MorphAudioProcessor::WorkerThread::computeStftMagnitudes(uint64_t frameSt
 
 void E1MorphAudioProcessor::WorkerThread::compressSpectrumToBands()
 {
+    const float flatteningAmount = juce::jlimit(0.0f, 1.0f,
+        spectralFlatteningAmount.load(std::memory_order_relaxed));
+    const float exponent = 1.0f - (0.5f * flatteningAmount);
+
     for (int ch = 0; ch < activeChannels; ++ch)
     {
         auto& srcBand = srcBandsPerChannel[static_cast<size_t>(ch)];
@@ -899,7 +918,7 @@ void E1MorphAudioProcessor::WorkerThread::compressSpectrumToBands()
             tgtBand(band) = juce::jmax(kDistributionFloor, tgtAccum / static_cast<float>(count));
         }
 
-        const float srcSum = juce::jmax(kDistributionFloor, srcBand.sum());
+        const float originalSrcSum = juce::jmax(kDistributionFloor, srcBand.sum());
         float tgtSum = tgtBand.sum();
         if (tgtSum <= kDistributionFloor)
         {
@@ -907,8 +926,26 @@ void E1MorphAudioProcessor::WorkerThread::compressSpectrumToBands()
             tgtSum = tgtBand.sum();
         }
 
-        const float scale = srcSum / juce::jmax(kDistributionFloor, tgtSum);
+        const float scale = originalSrcSum / juce::jmax(kDistributionFloor, tgtSum);
         tgtBand *= scale;
+
+        srcBand = srcBand.array().max(kDistributionFloor).pow(exponent).matrix();
+        tgtBand = tgtBand.array().max(kDistributionFloor).pow(exponent).matrix();
+
+        const float flattenedSrcSum = juce::jmax(kDistributionFloor, srcBand.sum());
+        const float flattenedTgtSum = juce::jmax(kDistributionFloor, tgtBand.sum());
+
+        srcBand *= (originalSrcSum / flattenedSrcSum);
+        tgtBand *= (originalSrcSum / flattenedTgtSum);
+
+        // Keep Sinkhorn mass consistent even after floor-clamping.
+        srcBand = srcBand.array().max(kDistributionFloor).matrix();
+        tgtBand = tgtBand.array().max(kDistributionFloor).matrix();
+
+        const float srcMassAfterClamp = juce::jmax(kDistributionFloor, srcBand.sum());
+        const float tgtMassAfterClamp = juce::jmax(kDistributionFloor, tgtBand.sum());
+        srcBand *= (originalSrcSum / srcMassAfterClamp);
+        tgtBand *= (originalSrcSum / tgtMassAfterClamp);
     }
 }
 
