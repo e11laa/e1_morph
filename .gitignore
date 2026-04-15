@@ -1,0 +1,91 @@
+# .gitignore for e1_morph (C++ / audio plugin project)
+# See: https://gitignore.io for templates (VisualStudio, C++, CMake, JetBrains, VSCode)
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Build directories & common artifacts ---
+/build/
+Builds/
+bin/
+bld/
+out/
+Binaries/
+Debug/
+Release/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+
+# --- Visual Studio ---
+.vs/
+*.vcxproj.user
+*.vcxproj.filters
+*.sln.docstates
+*.suo
+*.user
+*.userosscache
+*.VC.db
+*.VC.VC.opendb
+ipch/
+*.obj
+*.o
+*.pdb
+*.idb
+
+# --- Compiled binaries & libraries ---
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.lo
+
+# --- JUCE / plugin outputs (ignore built plugin binaries) ---
+*.vst
+*.vst3
+*.component
+*.aaxplugin
+*.au
+*.auplugin
+*.bundle
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.iml
+
+# --- Temp / backup files ---
+*~
+*.swp
+*.tmp
+*.bak
+*.old
+*.orig
+
+# --- Logs ---
+*.log
+
+# --- Archives / packages ---
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# --- Package managers / build tools ---
+.vcpkg/
+.vcpkg_installed
+
+# --- Language caches ---
+node_modules/
+__pycache__/
+*.pyc
+
+# End of file
