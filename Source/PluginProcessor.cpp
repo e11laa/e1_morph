@@ -21,6 +21,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout E1MorphAudioProcessor::creat
         juce::NormalisableRange<float>(0.0f, 0.99f, 0.001f),
         0.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "formantShift",
+        "Formant Shift (Semi)",
+        juce::NormalisableRange<float>(-12.0f, 12.0f, 0.1f),
+        0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
         "spectralFlattening",
         "Spectral Flattening",
         juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
@@ -236,6 +241,11 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     if (auto* glideParam = apvts.getRawParameterValue("glide"))
         glide = glideParam->load(std::memory_order_relaxed);
     worker.setGlideAmount(glide);
+
+    float formantShift = 0.0f;
+    if (auto* formantShiftParam = apvts.getRawParameterValue("formantShift"))
+        formantShift = formantShiftParam->load(std::memory_order_relaxed);
+    worker.setFormantShiftAmount(formantShift);
 
     float spectralFlattening = 0.0f;
     if (auto* spectralFlatteningParam = apvts.getRawParameterValue("spectralFlattening"))
@@ -491,6 +501,11 @@ void E1MorphAudioProcessor::WorkerThread::setGlideAmount(float amount) noexcept
     glideAmount.store(juce::jlimit(0.0f, 0.99f, amount), std::memory_order_relaxed);
 }
 
+void E1MorphAudioProcessor::WorkerThread::setFormantShiftAmount(float amount) noexcept
+{
+    formantShiftAmount.store(juce::jlimit(-12.0f, 12.0f, amount), std::memory_order_relaxed);
+}
+
 void E1MorphAudioProcessor::WorkerThread::setSpectralFlatteningAmount(float amount) noexcept
 {
     spectralFlatteningAmount.store(juce::jlimit(0.0f, 1.0f, amount), std::memory_order_relaxed);
@@ -583,6 +598,7 @@ void E1MorphAudioProcessor::WorkerThread::resetStreamingState(double sampleRate,
     smoothedMorph = morphAmount.load(std::memory_order_relaxed);
     smoothedFocus = focusAmount.load(std::memory_order_relaxed);
     smoothedGlide = glideAmount.load(std::memory_order_relaxed);
+    smoothedFormantShift = formantShiftAmount.load(std::memory_order_relaxed);
     envelopeFollower = 0.0f;
     envelopeReference = 0.0f;
     smoothedShapingGain = 0.0f;
@@ -647,6 +663,7 @@ void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
     const float morphTarget = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
     const float focusTarget = juce::jlimit(0.5f, 2.0f, focusAmount.load(std::memory_order_relaxed));
     const float glideTarget = juce::jlimit(0.0f, 0.99f, glideAmount.load(std::memory_order_relaxed));
+    const float formantShiftTarget = juce::jlimit(-12.0f, 12.0f, formantShiftAmount.load(std::memory_order_relaxed));
     const float transientBypassAmountValue = juce::jlimit(0.0f, 1.0f, transientBypassAmount.load(std::memory_order_relaxed));
     const float envModAmountValue = juce::jlimit(-1.0f, 1.0f, envModAmount.load(std::memory_order_relaxed));
     const float envShapeAmountValue = juce::jlimit(0.0f, 1.0f, envShapeAmount.load(std::memory_order_relaxed));
@@ -656,6 +673,7 @@ void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
     smoothedMorph += kParamSmooth * (morphTarget - smoothedMorph);
     smoothedFocus += kParamSmooth * (focusTarget - smoothedFocus);
     smoothedGlide += kParamSmooth * (glideTarget - smoothedGlide);
+    smoothedFormantShift += kParamSmooth * (formantShiftTarget - smoothedFormantShift);
 
     while (inputWriteSample >= (nextFrameStartSample + static_cast<uint64_t>(kFftSize)))
     {
@@ -1013,6 +1031,8 @@ void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum(float glide)
     constexpr float denom = static_cast<float>(kFftBins - 1);
     constexpr float bandMax = static_cast<float>(kCompressedBands - 1);
     const float clampedGlide = juce::jlimit(0.0f, 0.99f, glide);
+    const float shift = juce::jlimit(-12.0f, 12.0f, smoothedFormantShift);
+    const float factor = juce::jmax(kDistributionFloor, std::pow(2.0f, shift / 12.0f));
 
     for (int ch = 0; ch < activeChannels; ++ch)
     {
@@ -1022,7 +1042,8 @@ void E1MorphAudioProcessor::WorkerThread::expandBandsToSpectrum(float glide)
 
         for (int bin = 0; bin < kFftBins; ++bin)
         {
-            const float pos = (static_cast<float>(bin) / denom) * bandMax;
+            const float virtualBin = static_cast<float>(bin) / factor;
+            const float pos = (virtualBin / denom) * bandMax;
             const int i0 = juce::jlimit(0, kCompressedBands - 1, static_cast<int>(std::floor(pos)));
             const int i1 = juce::jmin(kCompressedBands - 1, i0 + 1);
             const float frac = pos - static_cast<float>(i0);
