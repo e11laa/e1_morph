@@ -224,8 +224,7 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
     wasOfflineLastBlock = isOffline;
 
     const bool hasSidechain = (getBusCount(true) > 1 && getChannelCountOfBus(true, 1) > 0);
-    const auto sidechain = hasSidechain ? getBusBuffer(buffer, true, 1) : juce::AudioBuffer<float> {};
-    const juce::AudioBuffer<float>& target = hasSidechain ? sidechain : source;
+    const auto target = hasSidechain ? getBusBuffer(buffer, true, 1) : source;
 
     float morph = 0.0f;
     if (auto* morphParam = apvts.getRawParameterValue("morph"))
@@ -314,8 +313,10 @@ void E1MorphAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
         float* out = output.getWritePointer(ch);
         for (int n = 0; n < numSamples; ++n)
         {
-            out[n] *= combinedGain;
-            out[n] = juce::jlimit(-1.0f, 1.0f, out[n]);
+            float y = out[n] * combinedGain;
+            if (!juce::isFinite(y))
+                y = 0.0f;
+            out[n] = juce::jlimit(-1.0f, 1.0f, y);
         }
     }
 }
@@ -415,12 +416,16 @@ bool E1MorphAudioProcessor::hasEditor() const
 
 void E1MorphAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    juce::ignoreUnused(destData);
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+    copyXmlToBinary(*xml, destData);
 }
 
 void E1MorphAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    juce::ignoreUnused(data, sizeInBytes);
+    std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
+    if (xmlState != nullptr && xmlState->hasTagName(apvts.state.getType()))
+        apvts.replaceState(juce::ValueTree::fromXml(*xmlState));
 }
 
 E1MorphAudioProcessor::WorkerThread::WorkerThread(E1MorphAudioProcessor& ownerRef)
@@ -651,14 +656,28 @@ void E1MorphAudioProcessor::WorkerThread::appendInputSamples(const AudioFrame& i
 
 void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
 {
-    constexpr float kParamSmooth = 0.2f;
-    constexpr float kEnvAttack = 0.3f;
-    constexpr float kEnvRelease = 0.06f;
-    constexpr float kGainAttack = 0.35f;
-    constexpr float kGainRelease = 0.08f;
+    constexpr float kParamSmoothMs = 50.0f;
+    constexpr float kEnvAttackMs = 10.0f;
+    constexpr float kEnvReleaseMs = 120.0f;
+    constexpr float kGainAttackMs = 25.0f;
+    constexpr float kGainReleaseMs = 150.0f;
     constexpr float kShapingEnergyThreshold = 1.0e-3f; // about -60 dBFS
     constexpr float kMaxShapingGainRatio = 4.0f;       // about +12 dB
     constexpr uint64_t kStartupGuardFrames = 2;
+
+    const float sampleRate = static_cast<float>(juce::jmax(1.0, sampleRateHz));
+    const float hopSeconds = static_cast<float>(kHopSize) / sampleRate;
+    const auto coeffFromMs = [hopSeconds](float timeMs) noexcept
+    {
+        const float tauSeconds = juce::jmax(1.0e-4f, 0.001f * timeMs);
+        return juce::jlimit(0.0f, 1.0f, 1.0f - std::exp(-hopSeconds / tauSeconds));
+    };
+
+    const float paramSmoothCoeff = coeffFromMs(kParamSmoothMs);
+    const float envAttackCoeff = coeffFromMs(kEnvAttackMs);
+    const float envReleaseCoeff = coeffFromMs(kEnvReleaseMs);
+    const float gainAttackCoeff = coeffFromMs(kGainAttackMs);
+    const float gainReleaseCoeff = coeffFromMs(kGainReleaseMs);
 
     const float morphTarget = juce::jlimit(0.0f, 1.0f, morphAmount.load(std::memory_order_relaxed));
     const float focusTarget = juce::jlimit(0.5f, 2.0f, focusAmount.load(std::memory_order_relaxed));
@@ -670,10 +689,10 @@ void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
     const int sourceSel = juce::jlimit(0, 1, envSource.load(std::memory_order_relaxed));
     const bool isOfflineRender = nonRealtimeMode.load(std::memory_order_relaxed);
 
-    smoothedMorph += kParamSmooth * (morphTarget - smoothedMorph);
-    smoothedFocus += kParamSmooth * (focusTarget - smoothedFocus);
-    smoothedGlide += kParamSmooth * (glideTarget - smoothedGlide);
-    smoothedFormantShift += kParamSmooth * (formantShiftTarget - smoothedFormantShift);
+    smoothedMorph += paramSmoothCoeff * (morphTarget - smoothedMorph);
+    smoothedFocus += paramSmoothCoeff * (focusTarget - smoothedFocus);
+    smoothedGlide += paramSmoothCoeff * (glideTarget - smoothedGlide);
+    smoothedFormantShift += paramSmoothCoeff * (formantShiftTarget - smoothedFormantShift);
 
     while (inputWriteSample >= (nextFrameStartSample + static_cast<uint64_t>(kFftSize)))
     {
@@ -681,7 +700,7 @@ void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
 
         const bool useSourceForEnvelope = (sourceSel == 0) || !sidechainActive.load(std::memory_order_relaxed);
         const float envInstant = computeAnalysisEnvelopeFromMagnitudes(activeChannels, useSourceForEnvelope);
-        const float coeff = (envInstant > envelopeFollower) ? kEnvAttack : kEnvRelease;
+        const float coeff = (envInstant > envelopeFollower) ? envAttackCoeff : envReleaseCoeff;
         envelopeFollower += coeff * (envInstant - envelopeFollower);
 
         envelopeFollower = juce::jlimit(0.0f, 1.0f, envelopeFollower);
@@ -756,7 +775,7 @@ void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
             }
 
             const float targetGain = (1.0f - envShapeAmountValue) + (envShapeAmountValue * matchedGain);
-            const float gainCoeff = (targetGain > smoothedShapingGain) ? kGainAttack : kGainRelease;
+            const float gainCoeff = (targetGain > smoothedShapingGain) ? gainAttackCoeff : gainReleaseCoeff;
             smoothedShapingGain += gainCoeff * (targetGain - smoothedShapingGain);
             smoothedShapingGain = juce::jmax(0.0f, smoothedShapingGain);
 
@@ -768,7 +787,7 @@ void E1MorphAudioProcessor::WorkerThread::renderAvailableStftFrames()
         }
         else
         {
-            smoothedShapingGain += 0.1f * (1.0f - smoothedShapingGain);
+            smoothedShapingGain += gainReleaseCoeff * (1.0f - smoothedShapingGain);
         }
 
         // Soft-start ramp is only for realtime playback safety, not offline rendering.
